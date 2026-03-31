@@ -362,7 +362,10 @@ function resolveWorkstream(cwd) {
   if (/Work:Resume|Outeach/i.test(cwd)) return 'rw-outreach';
   if (/workdirectory-legacy/i.test(cwd)) return 'workdirectory';
   if (/everything-claude-code/i.test(cwd)) return 'ecc';
-  return 'unknown';
+  // Architect path or default — most instances operate on ILP/Assay
+  const home = require('os').homedir();
+  if (cwd === home || cwd === '/Users') return 'architect';
+  return 'ilp';
 }
 
 /**
@@ -398,7 +401,16 @@ function classifyDelta(files) {
 function buildDeltaSummary(summary, files) {
   let text = '';
   if (summary && summary.userMessages && summary.userMessages.length > 0) {
-    text = summary.userMessages[0].replace(/\n/g, ' ').trim();
+    text = summary.userMessages[0]
+      .replace(/<[^>]+>/g, '')           // strip XML/HTML tags
+      .replace(/\s+/g, ' ')             // collapse whitespace
+      .replace(/^[\s\W]+/, '')           // trim leading non-word chars
+      .trim();
+    // Take first sentence or first 150 chars, whichever is shorter
+    const sentenceEnd = text.search(/[.!?]\s/);
+    if (sentenceEnd > 0 && sentenceEnd < 150) {
+      text = text.slice(0, sentenceEnd + 1);
+    }
   }
   const fileCount = files.length;
   const suffix = fileCount > 0 ? ` (${fileCount} file${fileCount === 1 ? '' : 's'} changed)` : '';
