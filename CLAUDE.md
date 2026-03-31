@@ -1,4 +1,5 @@
 # CLAUDE.md
+<!-- ORCHESTRATOR-MANAGED: Do not remove this marker. The daily review system checks for it. -->
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 

@@ -13,6 +13,8 @@ const path = require('path');
 const fs = require('fs');
 const {
   getSessionsDir,
+  getClaudeDir,
+  getHomeDir,
   getDateString,
   getTimeString,
   getSessionIdShort,
@@ -20,6 +22,7 @@ const {
   ensureDir,
   readFile,
   writeFile,
+  appendFile,
   runCommand,
   stripAnsi,
   log
@@ -260,7 +263,184 @@ async function main() {
     log(`[SessionEnd] Created session file: ${sessionFile}`);
   }
 
+  // --- Delta write ---
+  try {
+    writeDelta(summary, shortId);
+  } catch (err) {
+    log(`[SessionEnd] Delta write failed (non-fatal): ${err.message}`);
+  }
+
+  // --- Skill observation ---
+  try {
+    const { createSkillObservation, appendSkillObservation } = require('../lib/skill-improvement/observations');
+    const cwd = process.cwd();
+    const workstream = resolveWorkstream(cwd);
+    const filesModified = summary ? summary.filesModified : [];
+    const hasFilesModified = filesModified.length > 0;
+    const taskSummary = (summary && summary.userMessages && summary.userMessages.length > 0)
+      ? summary.userMessages[0].replace(/\n/g, ' ').trim()
+      : 'No task summary';
+
+    const observation = createSkillObservation({
+      task: taskSummary,
+      skill: {
+        id: workstream,
+        path: cwd
+      },
+      success: hasFilesModified,
+      error: hasFilesModified ? null : 'no files modified',
+      sessionId: shortId
+    });
+
+    appendSkillObservation(observation);
+    log(`[SessionEnd] Skill observation recorded for ${workstream} (success=${hasFilesModified})`);
+  } catch (err) {
+    log(`[SessionEnd] Skill observation failed (non-fatal): ${err.message}`);
+  }
+
   process.exit(0);
+}
+
+/**
+ * Determine the JSONL delta file path based on the current working directory.
+ */
+function resolveJsonlPath(cwd) {
+  const deltasDir = path.join(getHomeDir(), '.claude', 'deltas');
+
+  if (/intelligence-ledger|assay/i.test(cwd)) {
+    return path.join(deltasDir, 'assay.jsonl');
+  }
+  if (cwd === path.join(getHomeDir(), 'sam-assistant') || cwd.startsWith(path.join(getHomeDir(), 'sam-assistant') + path.sep)) {
+    return path.join(deltasDir, 'sam-assistant.jsonl');
+  }
+  if (/Work:Resume|Outeach/i.test(cwd)) {
+    return path.join(deltasDir, 'rw-outreach.jsonl');
+  }
+  if (/workdirectory-legacy/i.test(cwd)) {
+    return path.join(deltasDir, 'workdirectory.jsonl');
+  }
+  // Default
+  return path.join(deltasDir, 'assay.jsonl');
+}
+
+/**
+ * Detect files changed via git diff from session start HEAD to current HEAD.
+ * Falls back to transcript-parsed filesModified set.
+ */
+function detectFilesChanged(filesModifiedFromTranscript) {
+  const gitHeadStartFile = path.join(getSessionsDir(), '.git-head-start');
+  const startHead = readFile(gitHeadStartFile);
+
+  if (startHead && startHead.trim()) {
+    const sha = startHead.trim().replace(/[^a-f0-9]/gi, '');
+    if (sha.length >= 7) {
+      const result = runCommand(`git diff --name-only "${sha}..HEAD"`);
+      if (result.success && result.output.trim()) {
+        return {
+          files: result.output.split('\n').filter(Boolean),
+          via: 'git_diff'
+        };
+      }
+    }
+  }
+
+  return {
+    files: filesModifiedFromTranscript ? Array.from(filesModifiedFromTranscript) : [],
+    via: 'transcript'
+  };
+}
+
+/**
+ * Determine workstream identity from env or project path.
+ */
+function resolveWorkstream(cwd) {
+  if (process.env.ILP_WORKSTREAM) {
+    return process.env.ILP_WORKSTREAM;
+  }
+  if (/intelligence-ledger|assay/i.test(cwd)) return 'assay';
+  if (/sam-assistant/i.test(cwd)) return 'sam-assistant';
+  if (/Work:Resume|Outeach/i.test(cwd)) return 'rw-outreach';
+  if (/workdirectory-legacy/i.test(cwd)) return 'workdirectory';
+  if (/everything-claude-code/i.test(cwd)) return 'ecc';
+  return 'unknown';
+}
+
+/**
+ * Classify the delta type and impact based on changed files.
+ */
+function classifyDelta(files) {
+  let type = 'file_change';
+  for (const f of files) {
+    if (/migration|schema/i.test(f)) {
+      type = 'schema_change';
+      break;
+    }
+    if (/\.deploy|\.yml$|\.yaml$|vercel\.json/i.test(f)) {
+      type = 'deploy';
+      break;
+    }
+  }
+
+  const hasSchemaOrMigration = files.some(f => /migration|schema/i.test(f));
+  let impact = 'low';
+  if (hasSchemaOrMigration || files.length > 5) {
+    impact = 'high';
+  } else if (files.length >= 2) {
+    impact = 'medium';
+  }
+
+  return { type, impact, review_flag: impact === 'high' };
+}
+
+/**
+ * Build a short summary string from session tasks and files.
+ */
+function buildDeltaSummary(summary, files) {
+  let text = '';
+  if (summary && summary.userMessages && summary.userMessages.length > 0) {
+    text = summary.userMessages[0].replace(/\n/g, ' ').trim();
+  }
+  const fileCount = files.length;
+  const suffix = fileCount > 0 ? ` (${fileCount} file${fileCount === 1 ? '' : 's'} changed)` : '';
+  const combined = text + suffix;
+  return combined.slice(0, 200) || 'Session with no extractable summary';
+}
+
+/**
+ * Write a delta entry to the appropriate JSONL file.
+ */
+function writeDelta(summary, shortId) {
+  const totalMessages = summary ? summary.totalMessages : 0;
+  const filesModified = summary ? new Set(summary.filesModified) : new Set();
+
+  // Skip trivial sessions
+  if (totalMessages < 3 && filesModified.size === 0) {
+    log('[SessionEnd] Delta skip: trivial session (< 3 messages, 0 files)');
+    return;
+  }
+
+  const cwd = process.cwd();
+  const jsonlPath = resolveJsonlPath(cwd);
+  const { files, via } = detectFilesChanged(filesModified);
+  const workstream = resolveWorkstream(cwd);
+  const { type, impact, review_flag } = classifyDelta(files);
+
+  const delta = {
+    ts: new Date().toISOString(),
+    workstream,
+    repo: path.basename(cwd),
+    type,
+    summary: buildDeltaSummary(summary, files),
+    files: files.slice(0, 20),
+    files_via: via,
+    impact,
+    review_flag,
+    session_id: shortId
+  };
+
+  ensureDir(path.dirname(jsonlPath));
+  appendFile(jsonlPath, JSON.stringify(delta) + '\n');
+  log(`[SessionEnd] Delta written to ${jsonlPath} (${impact} impact, ${files.length} files via ${via})`);
 }
 
 function buildSummarySection(summary) {
