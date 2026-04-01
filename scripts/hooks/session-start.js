@@ -190,6 +190,29 @@ async function main() {
     log(`[SessionStart] Injected feedback rules (${injectionSize} bytes, assay=${isAssayProject})`);
   }
 
+  // --- Morning brief injection (architect instance only) ---
+  if (architectPaths.includes(cwd)) {
+    try {
+      const briefsDir = path.join(getHomeDir(), '.claude', 'daily-review', 'briefs');
+      const today = new Date().toISOString().slice(0, 10);
+      const briefPath = path.join(briefsDir, `${today}.md`);
+      const briefContent = readFile(briefPath);
+      if (briefContent) {
+        const briefSize = Buffer.byteLength(briefContent, 'utf8');
+        const remaining = BUDGET_LIMIT - injectionSize;
+        if (briefSize <= remaining) {
+          output(`\n📋 Morning Brief (${today}):\n${briefContent}`);
+          injectionSize += briefSize;
+          log(`[SessionStart] Injected morning brief (${briefSize} bytes)`);
+        } else {
+          log(`[SessionStart] Morning brief too large (${briefSize} bytes, ${remaining} remaining). Skipping.`);
+        }
+      }
+    } catch (err) {
+      log(`[SessionStart] Morning brief injection failed (non-fatal): ${err.message}`);
+    }
+  }
+
   // --- Delta injection: recent cross-workstream activity ---
   try {
     const deltasDir = path.join(getHomeDir(), '.claude', 'deltas');
@@ -306,6 +329,33 @@ async function main() {
     }
   } catch (deltaErr) {
     log(`[SessionStart] Warning: delta injection failed: ${deltaErr.message}`);
+  }
+
+  // --- Architect context ledger injection (architect instance only) ---
+  if (architectPaths.includes(cwd)) {
+    try {
+      const ledgerPath = path.join(getHomeDir(), '.claude', 'sessions', 'architect-ledger.md');
+      const ledgerContent = readFile(ledgerPath);
+      if (ledgerContent) {
+        const ledgerSize = Buffer.byteLength(ledgerContent, 'utf8');
+        const remaining = BUDGET_LIMIT - injectionSize;
+        if (ledgerSize <= remaining) {
+          output(`\n📋 Architect Context (from previous session):\n${ledgerContent}`);
+          injectionSize += ledgerSize;
+          log(`[SessionStart] Injected architect ledger (${ledgerSize} bytes)`);
+        } else if (remaining > 200) {
+          // Truncate to fit budget
+          const truncated = ledgerContent.slice(0, remaining - 50) + '\n\n_[Truncated to fit budget]_';
+          output(`\n📋 Architect Context (from previous session):\n${truncated}`);
+          injectionSize += Buffer.byteLength(truncated, 'utf8');
+          log(`[SessionStart] Injected architect ledger truncated to ${remaining} bytes (budget limit)`);
+        } else {
+          log(`[SessionStart] Skipping architect ledger: only ${remaining} bytes remaining in budget`);
+        }
+      }
+    } catch (err) {
+      log(`[SessionStart] Architect ledger injection failed (non-fatal): ${err.message}`);
+    }
   }
 
   // --- Skill health warning (from weekly maintenance report) ---

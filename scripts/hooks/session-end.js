@@ -25,12 +25,14 @@ const {
   appendFile,
   runCommand,
   stripAnsi,
-  log
+  log,
+  output
 } = require('../lib/utils');
 
 const SUMMARY_START_MARKER = '<!-- ECC:SUMMARY:START -->';
 const SUMMARY_END_MARKER = '<!-- ECC:SUMMARY:END -->';
 const SESSION_SEPARATOR = '\n---\n';
+const DELTA_OFFSETS_FILE = path.join(require('os').homedir(), '.claude', 'sessions', '.delta-watcher-offsets.json');
 
 /**
  * Extract a meaningful summary from the session transcript.
@@ -180,6 +182,98 @@ function mergeSessionHeader(content, today, currentTime, metadata) {
   return `${nextHeader}${SESSION_SEPARATOR}${body}`;
 }
 
+/**
+ * Turn-based delta watcher — checks if other workstreams wrote new deltas
+ * since the last turn. Lightweight: stat() + byte offset comparison.
+ * Only reads file content when something actually changed.
+ * The 1-hour time filter prevents re-surfacing what SessionStart already covered.
+ */
+function checkForNewDeltas() {
+  const deltasDir = path.join(getHomeDir(), '.claude', 'deltas');
+  if (!fs.existsSync(deltasDir)) return;
+
+  const cwd = process.cwd();
+  const myWorkstream = resolveWorkstream(cwd);
+  const myJsonlPath = resolveJsonlPath(cwd);
+
+  // Load saved offsets
+  let offsets = {};
+  try {
+    if (fs.existsSync(DELTA_OFFSETS_FILE)) {
+      offsets = JSON.parse(fs.readFileSync(DELTA_OFFSETS_FILE, 'utf-8'));
+    }
+  } catch { offsets = {}; }
+
+  // Find all JSONL files in deltas dir
+  let deltaFiles;
+  try {
+    deltaFiles = fs.readdirSync(deltasDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => path.join(deltasDir, f));
+  } catch { return; }
+
+  const newDeltas = [];
+  const updatedOffsets = { ...offsets };
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+
+  for (const filePath of deltaFiles) {
+    try {
+      const stat = fs.statSync(filePath);
+      const lastOffset = offsets[filePath] || 0;
+
+      // Fast path: file hasn't grown
+      if (stat.size <= lastOffset) {
+        updatedOffsets[filePath] = stat.size;
+        continue;
+      }
+
+      // Read only new bytes
+      const fd = fs.openSync(filePath, 'r');
+      const newBytes = Buffer.alloc(stat.size - lastOffset);
+      fs.readSync(fd, newBytes, 0, newBytes.length, lastOffset);
+      fs.closeSync(fd);
+
+      updatedOffsets[filePath] = stat.size;
+
+      // Parse new delta lines, keep only those from OTHER workstreams
+      const lines = newBytes.toString('utf-8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const delta = JSON.parse(line);
+          if (delta.workstream === myWorkstream) continue;
+          const deltaTime = new Date(delta.ts).getTime();
+          if (deltaTime && deltaTime >= oneHourAgo) {
+            newDeltas.push(delta);
+          }
+        } catch { /* malformed line, skip */ }
+      }
+    } catch { /* stat/read error, skip */ }
+  }
+
+  // Save updated offsets
+  try {
+    ensureDir(path.dirname(DELTA_OFFSETS_FILE));
+    fs.writeFileSync(DELTA_OFFSETS_FILE, JSON.stringify(updatedOffsets), 'utf-8');
+  } catch (err) {
+    log(`[TurnDeltaWatcher] Failed to save offsets: ${err.message}`);
+  }
+
+  // Output new deltas if any
+  if (newDeltas.length > 0) {
+    const lines = newDeltas.map(d => {
+      const age = Math.round((Date.now() - new Date(d.ts).getTime()) / 60000);
+      return `- **${d.workstream}** (${age}m ago): ${d.summary}${d.review_flag ? ' [REVIEW]' : ''}`;
+    });
+    // Cap at 1KB to avoid context bloat
+    let block = `\n--- Cross-Instance Update ---\n${lines.join('\n')}\n---`;
+    if (block.length > 1024) {
+      block = block.slice(0, 1020) + '...\n---';
+    }
+    output(block);
+    log(`[TurnDeltaWatcher] Surfaced ${newDeltas.length} new delta(s) from other workstreams`);
+  }
+}
+
 async function main() {
   // Parse stdin JSON to get transcript_path
   let transcriptPath = null;
@@ -296,6 +390,13 @@ async function main() {
     log(`[SessionEnd] Skill observation recorded for ${workstream} (success=${hasFilesModified})`);
   } catch (err) {
     log(`[SessionEnd] Skill observation failed (non-fatal): ${err.message}`);
+  }
+
+  // --- Mid-session delta watcher ---
+  try {
+    checkForNewDeltas();
+  } catch (err) {
+    log(`[TurnDeltaWatcher] Check failed (non-fatal): ${err.message}`);
   }
 
   process.exit(0);

@@ -446,6 +446,355 @@ function appendHarnessAudit() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. Obsidian Vault Rebuild
+// ---------------------------------------------------------------------------
+
+const VAULT_DIR = path.join(os.homedir(), 'Documents', 'assay-memory-vault');
+const MEMORY_DIR = path.join(CLAUDE_DIR, 'projects', '-Users', 'memory');
+
+function rebuildObsidianVault() {
+  log('Rebuilding Obsidian vault...');
+  const now = new Date().toISOString().slice(0, 10);
+
+  // Ensure dirs
+  for (const sub of ['memories', 'instances', 'systems', 'deltas']) {
+    ensureDir(path.join(VAULT_DIR, sub));
+  }
+
+  // --- 1. Memory files ---
+  const memoryFiles = [];
+  if (fs.existsSync(MEMORY_DIR)) {
+    const files = fs.readdirSync(MEMORY_DIR).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
+    for (const file of files) {
+      const src = path.join(MEMORY_DIR, file);
+      let content;
+      try { content = fs.readFileSync(src, 'utf-8'); } catch { continue; }
+
+      // Parse frontmatter
+      const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+      const name = file.replace('.md', '');
+      let type = 'memory';
+      let description = '';
+      if (fmMatch) {
+        const fm = fmMatch[1];
+        const typeMatch = fm.match(/type:\s*(.+)/);
+        const descMatch = fm.match(/description:\s*(.+)/);
+        if (typeMatch) type = typeMatch[1].trim();
+        if (descMatch) description = descMatch[1].trim();
+      }
+
+      // Build cross-links from content
+      const body = fmMatch ? fmMatch[2] : content;
+      const crossLinks = [];
+
+      // Link to instances mentioned
+      if (body.includes('intelligence-ledger') || body.includes('ILP')) crossLinks.push('[[ilp]]');
+      if (body.includes('everything-claude-code') || body.includes('ECC')) crossLinks.push('[[ecc]]');
+      if (body.includes('sam-assistant')) crossLinks.push('[[sam-assistant]]');
+      if (body.includes('assay-mcp')) crossLinks.push('[[assay-mcp]]');
+
+      // Link to systems mentioned
+      if (body.includes('delta') || body.includes('JSONL')) crossLinks.push('[[Delta Protocol]]');
+      if (body.includes('extraction') || body.includes('corpus')) crossLinks.push('[[Extraction Pipeline]]');
+      if (body.includes('agent') || body.includes('subagent')) crossLinks.push('[[Agent Orchestration]]');
+      if (body.includes('CLAUDE.md')) crossLinks.push('[[CLAUDE.md System]]');
+      if (body.includes('Notion')) crossLinks.push('[[Notion Integration]]');
+      if (body.includes('daily-review') || body.includes('brief')) crossLinks.push('[[Daily Review System]]');
+      if (body.includes('pattern') || body.includes('skill')) crossLinks.push('[[Learning Pipeline]]');
+
+      const uniqueLinks = [...new Set(crossLinks)];
+
+      const obsidianContent = `---
+tags: [memory, ${type}]
+type: ${type}
+source: ${file}
+updated: ${now}
+---
+
+# ${name}
+
+${description ? `> ${description}\n` : ''}
+${body.trim()}
+
+## Connections
+${uniqueLinks.length > 0 ? uniqueLinks.join('\n') : '*No cross-links detected*'}
+`;
+      fs.writeFileSync(path.join(VAULT_DIR, 'memories', `${name}.md`), obsidianContent, 'utf-8');
+      memoryFiles.push(name);
+    }
+  }
+
+  // --- 2. Instance nodes ---
+  const instanceNodes = [];
+  if (fs.existsSync(INSTANCE_REGISTRY)) {
+    try {
+      const registry = JSON.parse(fs.readFileSync(INSTANCE_REGISTRY, 'utf-8'));
+      for (const inst of (registry.instances || [])) {
+        const isAssay = ['ilp', 'assay-mcp', 'assaylabs-site'].includes(inst.name);
+        const links = ['[[Instance Map]]'];
+        if (isAssay) links.push('[[Delta Protocol]]', '[[Extraction Pipeline]]');
+        links.push('[[Daily Review System]]');
+        if (inst.has_git) links.push('[[CLAUDE.md System]]');
+
+        // Check CLAUDE.md freshness
+        let freshness = 'unknown';
+        if (inst.claude_md && fs.existsSync(inst.claude_md)) {
+          const days = Math.floor(daysSinceModified(inst.claude_md));
+          freshness = days <= 7 ? `fresh (${days}d)` : `stale (${days}d)`;
+        }
+
+        const instContent = `---
+tags: [instance, ${inst.type}]
+type: ${inst.type}
+path: ${inst.path}
+updated: ${now}
+---
+
+# ${inst.label}
+
+**ID:** \`${inst.name}\`
+**Type:** ${inst.type}
+**Path:** \`${inst.path}\`
+**Git:** ${inst.has_git ? 'Yes' : 'No'}
+**CLAUDE.md:** ${freshness}
+${inst.notes ? `\n> ${inst.notes}` : ''}
+
+## Connections
+${links.join('\n')}
+`;
+        fs.writeFileSync(path.join(VAULT_DIR, 'instances', `${inst.name}.md`), instContent, 'utf-8');
+        instanceNodes.push(inst.name);
+      }
+    } catch (err) {
+      log(`Warning: could not parse instance registry: ${err.message}`);
+    }
+  }
+
+  // --- 3. System concept nodes ---
+  const systems = {
+    'Delta Protocol': {
+      desc: 'Append-only JSONL logs written by session-end, read by session-start. Cross-instance awareness.',
+      links: () => {
+        const l = ['[[session-end.js]]', '[[session-start.js]]', '[[Memory Map]]'];
+        // Link to instances that produce deltas
+        if (fs.existsSync(DELTAS_DIR)) {
+          const files = fs.readdirSync(DELTAS_DIR).filter(f => f.endsWith('.jsonl'));
+          for (const f of files) {
+            const name = f.replace('.jsonl', '');
+            if (name === 'assay') l.push('[[ilp]]', '[[assay-mcp]]', '[[assaylabs-site]]', '[[ecc]]');
+            else if (instanceNodes.includes(name)) l.push(`[[${name}]]`);
+          }
+        }
+        return [...new Set(l)];
+      }
+    },
+    'Daily Review System': {
+      desc: 'Morning brief (7am) + EOD wrap-up (5:15pm) via launchd. Synthesizes cross-instance activity.',
+      links: () => ['[[Instance Map]]', '[[Delta Protocol]]', ...instanceNodes.map(n => `[[${n}]]`)]
+    },
+    'Learning Pipeline': {
+      desc: 'Observe patterns per session → consolidate weekly → surface as skills. 226→1 consolidated.md.',
+      links: () => {
+        const l = ['[[session-end.js]]', '[[Weekly Maintenance]]'];
+        const consolidated = path.join(LEARNED_DIR, 'consolidated.md');
+        if (fs.existsSync(consolidated)) {
+          const size = fs.statSync(consolidated).size;
+          l.push(`Consolidated: ${size} bytes`);
+        }
+        return l;
+      }
+    },
+    'Extraction Pipeline': {
+      desc: 'Stateless claim extraction from Notion corpus. Each section = fresh subagent, no context accumulation.',
+      links: () => ['[[feedback_context_isolation]]', '[[feedback_velocity_block]]', '[[ilp]]', '[[Agent Orchestration]]']
+    },
+    'Agent Orchestration': {
+      desc: 'Multi-agent deployment patterns. Test 1 first, then scale. Never change architecture mid-run.',
+      links: () => ['[[feedback_agent_discipline]]', '[[Extraction Pipeline]]', '[[ilp]]']
+    },
+    'Notion Integration': {
+      desc: 'MCP-connected Notion workspace. Nightly sync (4am), evidence retrieval, PRD management.',
+      links: () => ['[[ilp]]', '[[Daily Review System]]', '[[feedback_eval_include_urls]]']
+    },
+    'CLAUDE.md System': {
+      desc: 'Per-project instruction files. Must be updated whenever work ships. Orchestrator-managed marker.',
+      links: () => {
+        const l = ['[[feedback_claudemd_update]]', '[[Memory Map]]'];
+        for (const inst of instanceNodes) l.push(`[[${inst}]]`);
+        return l;
+      }
+    },
+    'Weekly Maintenance': {
+      desc: 'Sunday 3am via launchd. Pattern consolidation, delta rotation, stale detection, skill health, harness audit, vault rebuild.',
+      links: () => ['[[Learning Pipeline]]', '[[Delta Protocol]]', '[[CLAUDE.md System]]']
+    },
+    'Scoped Feedback Injection': {
+      desc: 'Universal rules (3 files) for ALL sessions. ILP-scoped rules (3 files) for Assay paths only.',
+      links: () => {
+        const l = ['[[session-start.js]]', '[[Memory Map]]'];
+        for (const m of memoryFiles) {
+          if (m.startsWith('feedback_')) l.push(`[[${m}]]`);
+        }
+        return l;
+      }
+    }
+  };
+
+  // Hook nodes
+  const hooks = {
+    'session-start.js': {
+      desc: 'Fires once on conversation open. Injects feedback rules + recent deltas.',
+      links: ['[[Delta Protocol]]', '[[Scoped Feedback Injection]]', '[[ecc]]']
+    },
+    'session-end.js': {
+      desc: 'Fires after each assistant turn (Stop hook). Writes delta, records skill observations.',
+      links: ['[[Delta Protocol]]', '[[Learning Pipeline]]', '[[ecc]]']
+    }
+  };
+
+  for (const [name, info] of Object.entries(systems)) {
+    const resolvedLinks = typeof info.links === 'function' ? info.links() : info.links;
+    const uniqueLinks = [...new Set(resolvedLinks)];
+    const content = `---
+tags: [system]
+updated: ${now}
+---
+
+# ${name}
+
+> ${info.desc}
+
+## Connections
+${uniqueLinks.join('\n')}
+`;
+    fs.writeFileSync(path.join(VAULT_DIR, 'systems', `${name}.md`), content, 'utf-8');
+  }
+
+  for (const [name, info] of Object.entries(hooks)) {
+    const content = `---
+tags: [hook]
+updated: ${now}
+---
+
+# ${name}
+
+> ${info.desc}
+
+## Connections
+${info.links.join('\n')}
+`;
+    fs.writeFileSync(path.join(VAULT_DIR, 'systems', `${name}.md`), content, 'utf-8');
+  }
+
+  // --- 4. Delta activity summary ---
+  if (fs.existsSync(DELTAS_DIR)) {
+    const jsonlFiles = fs.readdirSync(DELTAS_DIR).filter(f => f.endsWith('.jsonl'));
+    for (const file of jsonlFiles) {
+      const filePath = path.join(DELTAS_DIR, file);
+      const deltaName = file.replace('.jsonl', '');
+      try {
+        const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+        const deltas = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+        // Last 10 deltas
+        const recent = deltas.slice(-10);
+        const entries = recent.map(d => {
+          const time = new Date(d.ts).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+          const flag = d.review_flag ? ' ⚠' : '';
+          return `- **${time}** [${d.workstream}] ${d.summary || d.type}${flag}`;
+        });
+
+        // Workstream breakdown
+        const wsCounts = {};
+        for (const d of deltas) {
+          wsCounts[d.workstream] = (wsCounts[d.workstream] || 0) + 1;
+        }
+        const wsBreakdown = Object.entries(wsCounts).map(([ws, c]) => `- [[${ws === 'ecc' ? 'ecc' : ws}]]: ${c} sessions`);
+
+        const content = `---
+tags: [delta-log]
+updated: ${now}
+---
+
+# Deltas: ${deltaName}
+
+**Total entries:** ${deltas.length}
+**File:** \`~/.claude/deltas/${file}\`
+
+## Workstream Breakdown
+${wsBreakdown.join('\n')}
+
+## Recent Activity (last 10)
+${entries.join('\n')}
+
+## Connections
+[[Delta Protocol]]
+`;
+        fs.writeFileSync(path.join(VAULT_DIR, 'deltas', `${deltaName}.md`), content, 'utf-8');
+      } catch (err) {
+        log(`Warning: could not process ${file}: ${err.message}`);
+      }
+    }
+  }
+
+  // --- 5. Hub pages ---
+  // Memory Map
+  const memoryMapLinks = memoryFiles.map(m => {
+    const type = m.startsWith('feedback_') ? 'feedback' : m.startsWith('project_') ? 'project' : m.startsWith('architecture') ? 'architecture' : 'memory';
+    return `- [[${m}]] (${type})`;
+  });
+  const memoryMap = `---
+tags: [hub]
+updated: ${now}
+---
+
+# Memory Map
+
+## Memory Files
+${memoryMapLinks.join('\n')}
+
+## Systems
+${Object.keys(systems).map(s => `- [[${s}]]`).join('\n')}
+
+## Hooks
+${Object.keys(hooks).map(h => `- [[${h}]]`).join('\n')}
+`;
+  fs.writeFileSync(path.join(VAULT_DIR, 'Memory Map.md'), memoryMap, 'utf-8');
+
+  // Instance Map
+  const instanceMap = `---
+tags: [hub]
+updated: ${now}
+---
+
+# Instance Map
+
+## Active Instances
+${instanceNodes.map(n => `- [[${n}]]`).join('\n')}
+
+## Coordination
+- [[Delta Protocol]]
+- [[Daily Review System]]
+- [[Scoped Feedback Injection]]
+- [[CLAUDE.md System]]
+`;
+  fs.writeFileSync(path.join(VAULT_DIR, 'Instance Map.md'), instanceMap, 'utf-8');
+
+  // Clean up old top-level stubs that are now in subdirs
+  const stubs = ['Agent Orchestration.md', 'CLAUDE.md.md', 'Daily Review System.md',
+    'Extraction Pipeline.md', 'MCP Server.md', 'Notion Integration.md',
+    'Operating Protocol.md', 'PRD Process.md', 'V3 Extraction.md'];
+  for (const stub of stubs) {
+    const p = path.join(VAULT_DIR, stub);
+    if (fs.existsSync(p)) {
+      try { fs.unlinkSync(p); } catch { /* ignore */ }
+    }
+  }
+
+  log(`Vault rebuilt: ${memoryFiles.length} memories, ${instanceNodes.length} instances, ${Object.keys(systems).length + Object.keys(hooks).length} system nodes.`);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -488,6 +837,12 @@ function main() {
     appendHarnessAudit();
   } catch (err) {
     log(`ERROR in harness audit (non-fatal): ${err.message}`);
+  }
+
+  try {
+    rebuildObsidianVault();
+  } catch (err) {
+    log(`ERROR in Obsidian vault rebuild (non-fatal): ${err.message}`);
   }
 
   log('=== Weekly Maintenance Complete ===');
