@@ -410,18 +410,11 @@ function evaluateSession(rawInput) {
     ...extractWorkflowPatterns(session)
   ];
 
-  // Generate and write the skill file
+  // Generate and write the skill file — one file per session, overwritten each turn
   const today = getDateString();
   const shortId = getSessionIdShort();
-  const timestamp = Date.now();
-  const filename = `${today}-${shortId}-${timestamp}-patterns.md`;
+  const filename = `${today}-${shortId}-patterns.md`;
   const outputPath = path.join(learnedSkillsPath, filename);
-
-  // Never overwrite
-  if (fs.existsSync(outputPath)) {
-    log(`[ContinuousLearning] Skill file already exists: ${outputPath}`);
-    return null;
-  }
 
   const skillContent = generateSkillFile(session, allPatterns);
   writeFile(outputPath, skillContent);
