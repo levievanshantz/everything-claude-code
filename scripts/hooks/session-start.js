@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const {
   getSessionsDir,
   getSessionSearchDirs,
@@ -450,18 +451,144 @@ async function main() {
     log('[SessionStart] No specific project type detected');
   }
 
-  await writeSessionStartPayload(additionalContextParts.join('\n\n'));
+  // Tier 2 — cheap local semantic recall over ECC session history.
+  // Fires once per SessionStart. Zero remote calls (bge-large local).
+  // Failure is silent; this hook must never block session boot.
+  const tier2Digest = tryTier2Recall(cwd, projectInfo);
+  if (tier2Digest) additionalContextParts.push(tier2Digest);
+
+  const visibleBanner = buildVisibleBanner({
+    recentSessions,
+    aliases,
+    projectInfo,
+    pm,
+    cwd
+  });
+
+  await writeSessionStartPayload(additionalContextParts.join('\n\n'), visibleBanner);
 }
 
-function writeSessionStartPayload(additionalContext) {
+/**
+ * Tier 2 session memory recall. Calls `npm run assay -- memory recall`
+ * against the assaylabs repo if present; formats the top hits into a
+ * compact block (≤~150 tokens) for injection into SessionStart context.
+ *
+ * Returns null if the CLI isn't available, the query produces no hits,
+ * or anything errors. Never throws.
+ */
+function tryTier2Recall(cwd, projectInfo) {
+  const assaylabsRoot = path.join(getHomeDir(), 'assaylabs');
+  const assayCli = path.join(assaylabsRoot, 'bin', 'assay.ts');
+  const tsxBin = path.join(assaylabsRoot, 'node_modules', '.bin', 'tsx');
+  if (!fs.existsSync(assayCli) || !fs.existsSync(tsxBin)) return null;
+
+  // Build a concise recall query from cwd + project languages.
+  const cwdName = path.basename(cwd);
+  const langs = Array.isArray(projectInfo && projectInfo.languages)
+    ? projectInfo.languages.slice(0, 3).join(' ')
+    : '';
+  const query = [cwdName, langs].filter(Boolean).join(' ').slice(0, 160) ||
+    'recent session work';
+
+  try {
+    const res = spawnSync(
+      tsxBin,
+      [assayCli, 'memory', 'recall', query],
+      {
+        cwd: assaylabsRoot,
+        env: {
+          ...process.env,
+          // Force local provider so this never hits OpenAI from a hook.
+          EMBEDDING_PROVIDER: 'local',
+        },
+        encoding: 'utf8',
+        timeout: 8000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+
+    const out = stripAnsi(res.stdout || '');
+    // Parse the CLI's "  0.624  [kind]  title" lines.
+    const hitLines = out
+      .split('\n')
+      .filter((l) => /^\s+\d+\.\d+\s+\[/.test(l))
+      .slice(0, 3);
+    if (hitLines.length === 0) return null;
+
+    const escalateLine =
+      out.split('\n').find((l) => l.trim().startsWith('⚠')) || '';
+
+    const block = [
+      `Tier 2 session memory — prior work potentially relevant to this session:`,
+      ...hitLines.map((l) => l.trim()),
+    ];
+    if (escalateLine) block.push(escalateLine.trim());
+    block.push(
+      `(From ~/.assay/session-memory.db. Escalate to /assay-retrieve for citation-grade context.)`
+    );
+    return block.join('\n');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a compact, human-visible banner shown in the Claude Code UI
+ * at session start via the systemMessage field.
+ */
+function buildVisibleBanner({ recentSessions, aliases, projectInfo, pm, cwd }) {
+  const lines = [];
+  lines.push('🧠 ECC Session Loaded');
+
+  if (recentSessions && recentSessions.length > 0) {
+    const latest = recentSessions[0];
+    const basename = path.basename(latest.path).replace(/-session\.tmp$/, '');
+    lines.push(`• Resumed context from ${recentSessions.length} session(s); latest: ${basename}`);
+  }
+
+  // Morning brief / architect context (architect instance only)
+  const architectPaths = ['/Users/levishantz', '/Users'];
+  if (architectPaths.includes(cwd)) {
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const briefPath = path.join(getHomeDir(), '.claude', 'daily-review', 'briefs', `${today}.md`);
+      if (fs.existsSync(briefPath)) lines.push(`• Morning brief loaded: ${today}`);
+    } catch { /* noop */ }
+    try {
+      const ledgerPath = path.join(getHomeDir(), '.claude', 'sessions', 'architect-ledger.md');
+      if (fs.existsSync(ledgerPath)) lines.push('• Architect ledger loaded');
+    } catch { /* noop */ }
+  }
+
+  if (aliases && aliases.length > 0) {
+    lines.push(`• ${aliases.length} session alias(es) available`);
+  }
+
+  if (projectInfo && (projectInfo.languages.length > 0 || projectInfo.frameworks.length > 0)) {
+    const parts = [];
+    if (projectInfo.languages.length > 0) parts.push(projectInfo.languages.join(', '));
+    if (projectInfo.frameworks.length > 0) parts.push(projectInfo.frameworks.join(', '));
+    lines.push(`• Project: ${parts.join(' / ')}`);
+  }
+
+  if (pm && pm.name) {
+    lines.push(`• Package manager: ${pm.name}`);
+  }
+
+  return lines.join('\n');
+}
+
+function writeSessionStartPayload(additionalContext, systemMessage) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const payload = JSON.stringify({
+    const payloadObj = {
       hookSpecificOutput: {
         hookEventName: 'SessionStart',
         additionalContext
       }
-    });
+    };
+    if (systemMessage) payloadObj.systemMessage = systemMessage;
+    const payload = JSON.stringify(payloadObj);
 
     const handleError = (err) => {
       if (settled) return;
