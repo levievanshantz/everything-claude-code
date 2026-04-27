@@ -84,6 +84,69 @@ async function main() {
     }
   }
 
+  // --- Assay capability self-model injection ---
+  // Reads ~/.assay/CAPABILITIES.md (written atomically by assaylabs/scripts/install-bundle.sh)
+  // and prepends it to opening context. Graceful no-op if Assay isn't installed.
+  // Defense in depth (per codex review 2026-04-27):
+  //  - 8KB hard byte cap (skip injection if file is larger — defense vs prompt-injection growth)
+  //  - SHA-256 integrity check against ~/.assay/CAPABILITIES.md.sha256 sidecar (defense vs tampering)
+  //  - Version-stamp staleness warn (>30d since install → log warn, still inject)
+  //  - Counts against the 25KB BUDGET_LIMIT below (no bypass)
+  const CAPABILITIES_BYTE_CAP = 8192;
+  const CAPABILITIES_STALE_DAYS = 30;
+  let capabilitiesInjection = '';
+  let capabilitiesSize = 0;
+  try {
+    // Honor ASSAY_HOME env var so per-project silos can point at a separate
+    // capability self-model (e.g. workdirectory-live/.assay/CAPABILITIES.md).
+    const assayHome = process.env.ASSAY_HOME || path.join(getHomeDir(), '.assay');
+    const capabilitiesPath = path.join(assayHome, 'CAPABILITIES.md');
+    if (fs.existsSync(capabilitiesPath)) {
+      const stat = fs.statSync(capabilitiesPath);
+      if (stat.size > CAPABILITIES_BYTE_CAP) {
+        log(`[SessionStart] CAPABILITIES.md exceeds ${CAPABILITIES_BYTE_CAP}B cap (${stat.size}B) — skipping injection`);
+      } else {
+        const capabilitiesContent = readFile(capabilitiesPath);
+        if (capabilitiesContent && capabilitiesContent.trim().length > 0) {
+          // Integrity check: verify against sidecar SHA-256 if present.
+          const sidecarPath = `${capabilitiesPath}.sha256`;
+          let integrityOk = true;
+          if (fs.existsSync(sidecarPath)) {
+            try {
+              const expected = stripAnsi(readFile(sidecarPath)).trim().split(/\s+/)[0];
+              const crypto = require('crypto');
+              const actual = crypto.createHash('sha256').update(capabilitiesContent).digest('hex');
+              if (expected && expected !== actual) {
+                integrityOk = false;
+                log(`[SessionStart] CAPABILITIES.md sha256 mismatch (expected ${expected.slice(0,12)}, got ${actual.slice(0,12)}) — skipping injection. Re-run install-bundle.sh to fix.`);
+              }
+            } catch (e) {
+              log(`[SessionStart] CAPABILITIES.md integrity check failed: ${e.message} — skipping injection`);
+              integrityOk = false;
+            }
+          } else {
+            log(`[SessionStart] CAPABILITIES.md.sha256 sidecar missing — proceeding without integrity check`);
+          }
+          if (integrityOk) {
+            // Staleness check via VERSION line in front-matter.
+            const versionMatch = capabilitiesContent.match(/<!--\s*VERSION:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/);
+            if (versionMatch) {
+              const versionDate = new Date(versionMatch[1]);
+              const ageDays = (Date.now() - versionDate.getTime()) / 86400000;
+              if (ageDays > CAPABILITIES_STALE_DAYS) {
+                log(`[SessionStart] CAPABILITIES.md is ${Math.round(ageDays)}d old (>${CAPABILITIES_STALE_DAYS}d threshold) — re-run install-bundle.sh to refresh`);
+              }
+            }
+            capabilitiesInjection = `Assay memory capability self-model (authoritative — read before answering questions about what your memory does):\n\n${capabilitiesContent.trim()}`;
+            capabilitiesSize = Buffer.byteLength(capabilitiesInjection, 'utf8');
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log(`[SessionStart] Capabilities self-model not available: ${err.message}`);
+  }
+
   // --- Memory & feedback rule injection ---
   const BUDGET_LIMIT = 25600; // 25KB
   let injectionSize = 0;
@@ -158,9 +221,17 @@ async function main() {
   const universalContent = readFeedbackFiles(universalFiles);
   let injectionBlock = '';
 
+  // Capabilities self-model is highest-priority — counts against the 25KB budget.
+  if (capabilitiesInjection) {
+    injectionBlock += capabilitiesInjection;
+    injectionSize += capabilitiesSize;
+  }
+
   if (universalContent) {
-    injectionBlock += `Global rules (always active):\n${universalContent}`;
-    injectionSize += Buffer.byteLength(injectionBlock, 'utf8');
+    const sep = injectionBlock ? '\n\n' : '';
+    const universalBlock = `${sep}Global rules (always active):\n${universalContent}`;
+    injectionBlock += universalBlock;
+    injectionSize += Buffer.byteLength(universalBlock, 'utf8');
   }
 
   if (isAssayProject) {
