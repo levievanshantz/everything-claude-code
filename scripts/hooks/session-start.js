@@ -92,7 +92,11 @@ async function main() {
   //  - SHA-256 integrity check against ~/.assay/CAPABILITIES.md.sha256 sidecar (defense vs tampering)
   //  - Version-stamp staleness warn (>30d since install → log warn, still inject)
   //  - Counts against the 25KB BUDGET_LIMIT below (no bypass)
-  const CAPABILITIES_BYTE_CAP = 8192;
+  // Cap raised from 8KB → 12KB on 2026-04-28 to fit memory routing rules
+  // (the agentic-layer addition). Codex's original concern (prompt-injection
+  // attack surface scaling with file size) is still bounded; SHA-256 sidecar
+  // is the primary integrity defense, this cap is secondary.
+  const CAPABILITIES_BYTE_CAP = 12288;
   const CAPABILITIES_STALE_DAYS = 30;
   let capabilitiesInjection = '';
   let capabilitiesSize = 0;
