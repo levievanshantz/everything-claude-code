@@ -34,6 +34,101 @@ const SUMMARY_END_MARKER = '<!-- ECC:SUMMARY:END -->';
 const SESSION_SEPARATOR = '\n---\n';
 const DELTA_OFFSETS_FILE = path.join(require('os').homedir(), '.claude', 'sessions', '.delta-watcher-offsets.json');
 
+// Decision-tag debt audit. If the session shipped commits but emitted zero
+// drainable <decision> tags, we record debt keyed by cwd so SessionStart can
+// surface it next time. Compliance is invisible until `assay drain` finds
+// nothing — this hook makes it observable.
+function auditDecisionDebt(transcriptPath) {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
+  const content = readFile(transcriptPath);
+  if (!content) return null;
+
+  const lines = content.split('\n').filter(Boolean);
+  const commits = [];
+  let decisionCount = 0;
+
+  const tagRe = /<decision\b[^>]*>[\s\S]*?<\/decision>/g;
+  const msgRe = /-m\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))/;
+
+  for (const line of lines) {
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+
+    const collectCmd = (toolName, input) => {
+      if (toolName !== 'Bash') return;
+      const cmd = (input && (input.command || input.cmd)) || '';
+      if (!/git\s+commit\b/.test(cmd)) return;
+      if (/--amend\b/.test(cmd)) return;
+      const m = cmd.match(msgRe);
+      const message = m ? (m[1] || m[2] || m[3] || '').trim() : cmd.slice(0, 120);
+      commits.push(message);
+    };
+
+    if (entry.type === 'tool_use' || entry.tool_name) {
+      collectCmd(entry.tool_name || entry.name || '', entry.tool_input || entry.input || {});
+    }
+    if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+      for (const block of entry.message.content) {
+        if (block.type === 'tool_use') {
+          collectCmd(block.name || '', block.input || {});
+        }
+        if (block.type === 'text' && typeof block.text === 'string') {
+          const matches = block.text.match(tagRe);
+          if (matches) decisionCount += matches.length;
+        }
+      }
+    }
+    if (entry.type === 'assistant' && typeof entry.content === 'string') {
+      const matches = entry.content.match(tagRe);
+      if (matches) decisionCount += matches.length;
+    }
+  }
+
+  return { commitCount: commits.length, commits: commits.slice(0, 10), decisionCount };
+}
+
+function persistTagDebt(audit, sessionId) {
+  if (!audit) return;
+  const debtPath = path.join(getSessionsDir(), '.tag-debt.json');
+  ensureDir(path.dirname(debtPath));
+
+  let debt = { version: 1, entries: {} };
+  try {
+    const existing = readFile(debtPath);
+    if (existing) {
+      const parsed = JSON.parse(existing);
+      if (parsed && typeof parsed === 'object') debt = { version: 1, entries: parsed.entries || {} };
+    }
+  } catch { /* corrupt or missing — start fresh */ }
+
+  const cwd = process.cwd();
+
+  if (audit.commitCount > 0 && audit.decisionCount === 0) {
+    debt.entries[cwd] = {
+      count: audit.commitCount,
+      decision_count: audit.decisionCount,
+      commits: audit.commits,
+      session_id: sessionId,
+      updated_at: new Date().toISOString()
+    };
+    log(`[SessionEnd] Tag debt recorded: ${audit.commitCount} commits, 0 decision tags`);
+  } else if (audit.commitCount > 0 && audit.decisionCount > 0 && debt.entries[cwd]) {
+    // Only a *compliant commit-shipping* session clears debt. A no-commit
+    // session leaves prior debt alone — it stays sticky until cleared.
+    delete debt.entries[cwd];
+    log(`[SessionEnd] Tag debt cleared (compliant session: ${audit.commitCount} commits, ${audit.decisionCount} tags)`);
+  } else if (audit.commitCount === 0 && debt.entries[cwd]) {
+    log(`[SessionEnd] Tag debt unchanged (no commits this session; debt for ${cwd} remains)`);
+  }
+
+  if (Object.keys(debt.entries).length === 0) {
+    try { fs.unlinkSync(debtPath); } catch { /* not present */ }
+    return;
+  }
+
+  writeFile(debtPath, JSON.stringify(debt, null, 2));
+}
+
 /**
  * Extract a meaningful summary from the session transcript.
  * Reads the JSONL transcript and pulls out key information:
@@ -397,6 +492,14 @@ async function main() {
     checkForNewDeltas();
   } catch (err) {
     log(`[TurnDeltaWatcher] Check failed (non-fatal): ${err.message}`);
+  }
+
+  // --- Decision-tag debt audit ---
+  try {
+    const audit = auditDecisionDebt(transcriptPath);
+    if (audit) persistTagDebt(audit, shortId);
+  } catch (err) {
+    log(`[SessionEnd] Tag debt audit failed (non-fatal): ${err.message}`);
   }
 
   process.exit(0);

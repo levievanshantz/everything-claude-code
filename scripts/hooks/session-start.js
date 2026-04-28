@@ -266,6 +266,34 @@ async function main() {
     log(`[SessionStart] Injected feedback rules (${injectionSize} bytes, assay=${isAssayProject})`);
   }
 
+  // --- Tag-debt surfacing ---
+  // Persist debt across sessions until a compliant session clears it.
+  // Surfacing only stamps last_surfaced_at + increments surface_count;
+  // the entry is deleted by session-end.js when commits>0 && tags>0.
+  try {
+    const debtPath = path.join(sessionsDir, '.tag-debt.json');
+    if (fs.existsSync(debtPath)) {
+      const raw = readFile(debtPath);
+      const debt = raw ? JSON.parse(raw) : null;
+      const entry = debt && debt.entries ? debt.entries[cwd] : null;
+      if (entry) {
+        const commitList = (entry.commits || []).map(c => `  - ${c}`).join('\n');
+        const surfaceNote = entry.surface_count
+          ? ` (still uncleared after ${entry.surface_count} prior reminder${entry.surface_count > 1 ? 's' : ''})`
+          : '';
+        const banner = `Decision-tag debt${surfaceNote} — last session shipped ${entry.count} commits in this worktree and emitted ${entry.decision_count} <decision> tags.\nUncaptured commits:\n${commitList}\n\nTo clear this debt: emit <decision impact="..." confidence="..." layer="..."> inline when committing a material decision this session. The Stop hook clears the entry when it sees commits>0 && tags>0.`;
+        output(`\n${banner}\n`);
+        log(`[SessionStart] Surfaced tag debt for ${cwd}: ${entry.count} commits / ${entry.decision_count} tags (surface #${(entry.surface_count || 0) + 1})`);
+
+        entry.surface_count = (entry.surface_count || 0) + 1;
+        entry.last_surfaced_at = new Date().toISOString();
+        writeFile(debtPath, JSON.stringify(debt, null, 2));
+      }
+    }
+  } catch (err) {
+    log(`[SessionStart] Tag debt surfacing failed (non-fatal): ${err.message}`);
+  }
+
   // --- Morning brief injection (architect instance only) ---
   if (architectPaths.includes(cwd)) {
     try {
