@@ -160,9 +160,10 @@ async function main() {
 
   // Determine if CWD is an Assay/ILP project
   const assayPaths = [
-    '/Users/levishantz/intelligence-ledger-prototype',
+    '/Users/levishantz/assaylabs',
+    '/Users/levishantz/assaylabs-docs-site',
     '/Users/levishantz/assay-mcp-server',
-    '/Users/levishantz/assaylabs-docs-site'
+    '/Users/levishantz/intelligence-ledger-prototype' // legacy, kept for back-compat with old workspaces
   ];
   const architectPaths = ['/Users/levishantz', '/Users'];
 

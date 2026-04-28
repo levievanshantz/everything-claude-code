@@ -19,7 +19,7 @@ const LEARNED_DIR = getLearnedSkillsDir();
 const DELTAS_DIR = path.join(CLAUDE_DIR, 'deltas');
 const DAILY_REVIEW_DIR = path.join(CLAUDE_DIR, 'daily-review');
 const INSTANCE_REGISTRY = path.join(DAILY_REVIEW_DIR, 'instance-registry.json');
-const STRATEGY_FILE = '/Users/levishantz/intelligence-ledger-prototype/STRATEGY.md';
+const STRATEGY_FILE = '/Users/levishantz/assaylabs/STRATEGY.md';
 const MAX_CONSOLIDATED_SIZE = 5 * 1024; // 5KB
 
 // ---------------------------------------------------------------------------
@@ -488,7 +488,7 @@ function rebuildObsidianVault() {
       const crossLinks = [];
 
       // Link to instances mentioned
-      if (body.includes('intelligence-ledger') || body.includes('ILP')) crossLinks.push('[[ilp]]');
+      if (body.includes('assay') || body.includes('intelligence-ledger') || body.includes('ILP')) crossLinks.push('[[assay]]');
       if (body.includes('everything-claude-code') || body.includes('ECC')) crossLinks.push('[[ecc]]');
       if (body.includes('sam-assistant')) crossLinks.push('[[sam-assistant]]');
       if (body.includes('assay-mcp')) crossLinks.push('[[assay-mcp]]');
