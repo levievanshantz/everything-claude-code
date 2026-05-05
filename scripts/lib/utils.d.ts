@@ -66,6 +66,12 @@ export function sanitizeSessionId(raw: string | null | undefined): string | null
  */
 export function getSessionIdShort(fallback?: string, cwd?: string): string;
 
+/**
+ * Resolve a project cwd from a hook input string. Falls back to process.cwd()
+ * when omitted; canonicalizes via realpathSync (path.resolve fallback).
+ */
+export function resolveProjectCwd(rawCwd?: string | null): string;
+
 /** Get the git repository name. Optional cwd resolves against an explicit directory. */
 export function getGitRepoName(cwd?: string): string | null;
 

@@ -18,6 +18,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const { spawn, spawnSync } = require('child_process');
+const { resolveProjectCwd } = require('../lib/utils');
 
 const MAX_STDIN = 1024 * 1024;
 const DEFAULT_TTL_MS = 2 * 60 * 1000;
@@ -46,7 +47,7 @@ function stateFilePath() {
   return path.join(os.homedir(), '.claude', 'mcp-health-cache.json');
 }
 
-function configPaths() {
+function configPaths(projectCwd) {
   if (process.env.ECC_MCP_CONFIG_PATH) {
     return process.env.ECC_MCP_CONFIG_PATH
       .split(path.delimiter)
@@ -55,7 +56,10 @@ function configPaths() {
       .map(entry => path.resolve(entry));
   }
 
-  const cwd = process.cwd();
+  // projectCwd comes from input.cwd (Claude Code stdin) — process.cwd() can
+  // point elsewhere when sessions span repos. Fall back to process.cwd() for
+  // CLI/test contexts that invoke this without an input cwd.
+  const cwd = projectCwd || process.cwd();
   const home = os.homedir();
 
   return [
@@ -173,8 +177,8 @@ function extractMcpTargetFromRaw(raw) {
   });
 }
 
-function resolveServerConfig(serverName) {
-  for (const filePath of configPaths()) {
+function resolveServerConfig(serverName, projectCwd) {
+  for (const filePath of configPaths(projectCwd)) {
     const data = readJsonFile(filePath);
     const server = data?.mcpServers?.[serverName]
       || data?.mcp_servers?.[serverName]
@@ -293,7 +297,7 @@ function requestHttp(urlString, headers, timeoutMs) {
   });
 }
 
-function probeCommandServer(serverName, config) {
+function probeCommandServer(serverName, config, projectCwd) {
   return new Promise(resolve => {
     const command = config.command;
     const args = Array.isArray(config.args) ? config.args.map(arg => String(arg)) : [];
@@ -316,7 +320,7 @@ function probeCommandServer(serverName, config) {
     try {
       child = spawn(command, args, {
         env: mergedEnv,
-        cwd: process.cwd(),
+        cwd: projectCwd || process.cwd(),
         stdio: ['pipe', 'ignore', 'pipe']
       });
     } catch (error) {
@@ -379,7 +383,7 @@ function probeCommandServer(serverName, config) {
   });
 }
 
-async function probeServer(serverName, resolvedConfig) {
+async function probeServer(serverName, resolvedConfig, projectCwd) {
   const config = resolvedConfig.config;
 
   if (config.type === 'http' || config.url) {
@@ -394,7 +398,7 @@ async function probeServer(serverName, resolvedConfig) {
   }
 
   if (config.command) {
-    const result = await probeCommandServer(serverName, config);
+    const result = await probeCommandServer(serverName, config, projectCwd);
 
     return {
       ok: result.ok,
@@ -424,7 +428,7 @@ function reconnectCommand(serverName) {
     : command;
 }
 
-function attemptReconnect(serverName) {
+function attemptReconnect(serverName, projectCwd) {
   const command = reconnectCommand(serverName);
   if (!command) {
     return { attempted: false, success: false, reason: 'no reconnect command configured' };
@@ -433,7 +437,7 @@ function attemptReconnect(serverName) {
   const result = spawnSync(command, {
     shell: true,
     env: process.env,
-    cwd: process.cwd(),
+    cwd: projectCwd || process.cwd(),
     encoding: 'utf8',
     timeout: envNumber('ECC_MCP_RECONNECT_TIMEOUT_MS', DEFAULT_TIMEOUT_MS)
   });
@@ -463,7 +467,7 @@ function emitLogs(logs) {
   }
 }
 
-async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
+async function handlePreToolUse(rawInput, input, target, statePathValue, now, projectCwd) {
   const logs = [];
   const state = loadState(statePathValue);
   const previous = state.servers[target.server] || {};
@@ -479,13 +483,13 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
     return { rawInput, exitCode: shouldFailOpen() ? 0 : 2, logs };
   }
 
-  const resolvedConfig = resolveServerConfig(target.server);
+  const resolvedConfig = resolveServerConfig(target.server, projectCwd);
   if (!resolvedConfig) {
     logs.push(`[MCPHealthCheck] No MCP config found for ${target.server}; skipping preflight probe`);
     return { rawInput, exitCode: 0, logs };
   }
 
-  const probe = await probeServer(target.server, resolvedConfig);
+  const probe = await probeServer(target.server, resolvedConfig, projectCwd);
   if (probe.ok) {
     markHealthy(state, target.server, now, { source: resolvedConfig.source });
     saveState(statePathValue, state);
@@ -499,9 +503,9 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
 
   let reconnect = { attempted: false, success: false, reason: 'probe failed' };
   if (probe.failureCode || previous.status === 'unhealthy') {
-    reconnect = attemptReconnect(target.server);
+    reconnect = attemptReconnect(target.server, projectCwd);
     if (reconnect.success) {
-      const reprobe = await probeServer(target.server, resolvedConfig);
+      const reprobe = await probeServer(target.server, resolvedConfig, projectCwd);
       if (reprobe.ok) {
         markHealthy(state, target.server, now, {
           source: resolvedConfig.source,
@@ -528,7 +532,7 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
   return { rawInput, exitCode: shouldFailOpen() ? 0 : 2, logs };
 }
 
-async function handlePostToolUseFailure(rawInput, input, target, statePathValue, now) {
+async function handlePostToolUseFailure(rawInput, input, target, statePathValue, now, projectCwd) {
   const logs = [];
   const summary = failureSummary(input);
   const failureCode = detectFailureCode(summary);
@@ -543,7 +547,7 @@ async function handlePostToolUseFailure(rawInput, input, target, statePathValue,
 
   logs.push(`[MCPHealthCheck] ${target.server} reported ${failureCode}; marking server unhealthy and attempting reconnect`);
 
-  const reconnect = attemptReconnect(target.server);
+  const reconnect = attemptReconnect(target.server, projectCwd);
   if (!reconnect.attempted) {
     logs.push(`[MCPHealthCheck] ${target.server} reconnect skipped: ${reconnect.reason}`);
     return { rawInput, exitCode: 0, logs };
@@ -554,13 +558,13 @@ async function handlePostToolUseFailure(rawInput, input, target, statePathValue,
     return { rawInput, exitCode: 0, logs };
   }
 
-  const resolvedConfig = resolveServerConfig(target.server);
+  const resolvedConfig = resolveServerConfig(target.server, projectCwd);
   if (!resolvedConfig) {
     logs.push(`[MCPHealthCheck] ${target.server} reconnect completed but no config was available for a follow-up probe`);
     return { rawInput, exitCode: 0, logs };
   }
 
-  const reprobe = await probeServer(target.server, resolvedConfig);
+  const reprobe = await probeServer(target.server, resolvedConfig, projectCwd);
   if (!reprobe.ok) {
     logs.push(`[MCPHealthCheck] ${target.server} reconnect command ran, but health probe still failed: ${reprobe.reason}`);
     return { rawInput, exitCode: 0, logs };
@@ -603,10 +607,15 @@ async function main() {
   const eventName = process.env.CLAUDE_HOOK_EVENT_NAME || 'PreToolUse';
   const now = Date.now();
   const statePathValue = stateFilePath();
+  // Resolve once: project-local config discovery, MCP probe spawn cwd, and
+  // reconnect spawnSync cwd all need to agree on which directory represents
+  // the active project. process.cwd() can drift from input.cwd when the hook
+  // process inherits a parent cwd that points elsewhere.
+  const projectCwd = resolveProjectCwd(typeof input?.cwd === 'string' ? input.cwd : null);
 
   const result = eventName === 'PostToolUseFailure'
-    ? await handlePostToolUseFailure(rawInput, input, target, statePathValue, now)
-    : await handlePreToolUse(rawInput, input, target, statePathValue, now);
+    ? await handlePostToolUseFailure(rawInput, input, target, statePathValue, now, projectCwd)
+    : await handlePreToolUse(rawInput, input, target, statePathValue, now, projectCwd);
 
   emitLogs(result.logs);
   process.stdout.write(result.rawInput);

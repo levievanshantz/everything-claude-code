@@ -19,6 +19,7 @@ const {
   getTimeString,
   getSessionIdShort,
   getProjectName,
+  resolveProjectCwd,
   ensureDir,
   readFile,
   writeFile,
@@ -396,15 +397,8 @@ async function main() {
 
   // Resolve once: every downstream consumer (debt key, delta workstream,
   // skill observation, git diff for files-changed, session-id fallback)
-  // must agree on which directory represents the active project. Normalize
-  // through realpathSync so symlink-vs-realpath asymmetry doesn't strand
-  // debt entries — SessionStart reads the same key off resolved cwd.
-  let projectCwd = inputCwd || process.cwd();
-  try {
-    projectCwd = fs.realpathSync(projectCwd);
-  } catch {
-    projectCwd = path.resolve(projectCwd);
-  }
+  // must agree on which directory represents the active project.
+  const projectCwd = resolveProjectCwd(inputCwd);
 
   const sessionsDir = getSessionsDir();
   const today = getDateString();

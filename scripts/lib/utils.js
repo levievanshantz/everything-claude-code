@@ -112,6 +112,23 @@ function getTimeString() {
 }
 
 /**
+ * Resolve the project cwd a hook should operate on. Claude Code includes
+ * `cwd` in hook input JSON; the hook process's own cwd can be elsewhere
+ * (e.g. inherits /Users/levishantz when sessions span multiple projects).
+ * Canonicalize through realpathSync so symlink-vs-realpath asymmetry can't
+ * desync writes from reads. Falls back to path.resolve when the path
+ * doesn't exist (test scenarios) and to process.cwd() when no input given.
+ */
+function resolveProjectCwd(rawCwd) {
+  let candidate = rawCwd || process.cwd();
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+/**
  * Get the git repository name. Accepts optional cwd so callers running
  * outside the project root (e.g. Stop hooks invoked with the parent
  * process's cwd) can resolve against the right directory.
@@ -607,6 +624,7 @@ module.exports = {
   getSessionIdShort,
   getGitRepoName,
   getProjectName,
+  resolveProjectCwd,
 
   // File operations
   findFiles,

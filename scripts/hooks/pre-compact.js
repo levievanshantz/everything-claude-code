@@ -26,10 +26,15 @@ const {
   appendFile,
   stripAnsi,
   log,
-  output
+  output,
+  resolveProjectCwd
 } = require('../lib/utils');
 
-const ARCHITECT_PATHS = ['/Users/levishantz', '/Users'];
+// Realpath-normalize architect roots once at module load so a realpath'd
+// projectCwd compares correctly to symlinked `/Users` aliases.
+const ARCHITECT_PATHS = ['/Users/levishantz', '/Users'].map(p => {
+  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+});
 const MAX_LEDGER_BYTES = 10 * 1024; // 10KB cap
 
 const DECISION_PATTERNS = [
@@ -44,10 +49,12 @@ const DECISION_PATTERNS = [
 ];
 
 /**
- * Check if CWD is the architect instance
+ * Check if a given cwd points at the architect instance. Pass the
+ * resolved projectCwd (from input.cwd via resolveProjectCwd) — defaulting
+ * to process.cwd() loses the input.cwd Claude Code passes in stdin.
  */
-function isArchitectInstance() {
-  const cwd = process.cwd();
+function isArchitectInstance(projectCwd) {
+  const cwd = projectCwd || resolveProjectCwd();
   return ARCHITECT_PATHS.includes(cwd);
 }
 
@@ -324,8 +331,17 @@ function run(rawInput) {
   try {
     corePreCompact();
 
+    // Resolve projectCwd from stdin once; the hook process's own cwd may
+    // point elsewhere (e.g. /Users/levishantz when sessions span repos).
+    let inputCwd = null;
+    try {
+      const parsed = rawInput ? JSON.parse(rawInput) : null;
+      if (parsed && typeof parsed.cwd === 'string') inputCwd = parsed.cwd;
+    } catch { /* malformed stdin — fall through to process.cwd() */ }
+    const projectCwd = resolveProjectCwd(inputCwd);
+
     // Architect-specific: write rich context ledger
-    if (isArchitectInstance()) {
+    if (isArchitectInstance(projectCwd)) {
       writeArchitectLedger(rawInput);
     }
   } catch (err) {
