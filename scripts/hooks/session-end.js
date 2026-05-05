@@ -87,7 +87,7 @@ function auditDecisionDebt(transcriptPath) {
   return { commitCount: commits.length, commits: commits.slice(0, 10), decisionCount };
 }
 
-function persistTagDebt(audit, sessionId) {
+function persistTagDebt(audit, sessionId, projectCwd) {
   if (!audit) return;
   const debtPath = path.join(getSessionsDir(), '.tag-debt.json');
   ensureDir(path.dirname(debtPath));
@@ -101,7 +101,9 @@ function persistTagDebt(audit, sessionId) {
     }
   } catch { /* corrupt or missing — start fresh */ }
 
-  const cwd = process.cwd();
+  // Key debt by the project cwd Claude Code passed in, not the hook process's
+  // inherited cwd — same reason header capture takes an explicit cwd.
+  const cwd = projectCwd || process.cwd();
 
   if (audit.commitCount > 0 && audit.decisionCount === 0) {
     debt.entries[cwd] = {
@@ -232,13 +234,20 @@ function runMain() {
   });
 }
 
-function getSessionMetadata() {
-  const branchResult = runCommand('git rev-parse --abbrev-ref HEAD');
+function getSessionMetadata(cwd) {
+  // Stop hook input includes `cwd` (the project dir Claude Code is rooted in).
+  // The hook process itself can inherit a different cwd from the parent
+  // (e.g. /Users/levishantz when sessions span multiple projects), which made
+  // git/getProjectName resolve against the wrong directory and stamp the .tmp
+  // file with Project: unknown / Branch: unknown. Always thread the explicit
+  // cwd through.
+  const resolvedCwd = cwd || process.cwd();
+  const branchResult = runCommand('git rev-parse --abbrev-ref HEAD', { cwd: resolvedCwd });
 
   return {
-    project: getProjectName() || 'unknown',
+    project: getProjectName(resolvedCwd) || 'unknown',
     branch: branchResult.success ? branchResult.output : 'unknown',
-    worktree: process.cwd()
+    worktree: resolvedCwd
   };
 }
 
@@ -283,11 +292,11 @@ function mergeSessionHeader(content, today, currentTime, metadata) {
  * Only reads file content when something actually changed.
  * The 1-hour time filter prevents re-surfacing what SessionStart already covered.
  */
-function checkForNewDeltas() {
+function checkForNewDeltas(projectCwd) {
   const deltasDir = path.join(getHomeDir(), '.claude', 'deltas');
   if (!fs.existsSync(deltasDir)) return;
 
-  const cwd = process.cwd();
+  const cwd = projectCwd || process.cwd();
   const myWorkstream = resolveWorkstream(cwd);
   const myJsonlPath = resolveJsonlPath(cwd);
 
@@ -370,21 +379,38 @@ function checkForNewDeltas() {
 }
 
 async function main() {
-  // Parse stdin JSON to get transcript_path
+  // Parse stdin JSON to get transcript_path + cwd.
+  // Claude Code passes the active project cwd in the hook input; the hook
+  // process's own cwd can differ (e.g. inherits /Users/levishantz). Without
+  // reading input.cwd the metadata capture lands "Project: unknown".
   let transcriptPath = null;
+  let inputCwd = null;
   try {
     const input = JSON.parse(stdinData);
     transcriptPath = input.transcript_path;
+    inputCwd = input.cwd || null;
   } catch {
     // Fallback: try env var for backwards compatibility
     transcriptPath = process.env.CLAUDE_TRANSCRIPT_PATH;
   }
 
+  // Resolve once: every downstream consumer (debt key, delta workstream,
+  // skill observation, git diff for files-changed, session-id fallback)
+  // must agree on which directory represents the active project. Normalize
+  // through realpathSync so symlink-vs-realpath asymmetry doesn't strand
+  // debt entries — SessionStart reads the same key off resolved cwd.
+  let projectCwd = inputCwd || process.cwd();
+  try {
+    projectCwd = fs.realpathSync(projectCwd);
+  } catch {
+    projectCwd = path.resolve(projectCwd);
+  }
+
   const sessionsDir = getSessionsDir();
   const today = getDateString();
-  const shortId = getSessionIdShort();
+  const shortId = getSessionIdShort('default', projectCwd);
   const sessionFile = path.join(sessionsDir, `${today}-${shortId}-session.tmp`);
-  const sessionMetadata = getSessionMetadata();
+  const sessionMetadata = getSessionMetadata(projectCwd);
 
   ensureDir(sessionsDir);
 
@@ -454,7 +480,7 @@ async function main() {
 
   // --- Delta write ---
   try {
-    writeDelta(summary, shortId);
+    writeDelta(summary, shortId, projectCwd);
   } catch (err) {
     log(`[SessionEnd] Delta write failed (non-fatal): ${err.message}`);
   }
@@ -462,7 +488,7 @@ async function main() {
   // --- Skill observation ---
   try {
     const { createSkillObservation, appendSkillObservation } = require('../lib/skill-improvement/observations');
-    const cwd = process.cwd();
+    const cwd = projectCwd;
     const workstream = resolveWorkstream(cwd);
     const filesModified = summary ? summary.filesModified : [];
     const hasFilesModified = filesModified.length > 0;
@@ -489,7 +515,7 @@ async function main() {
 
   // --- Mid-session delta watcher ---
   try {
-    checkForNewDeltas();
+    checkForNewDeltas(projectCwd);
   } catch (err) {
     log(`[TurnDeltaWatcher] Check failed (non-fatal): ${err.message}`);
   }
@@ -497,7 +523,7 @@ async function main() {
   // --- Decision-tag debt audit ---
   try {
     const audit = auditDecisionDebt(transcriptPath);
-    if (audit) persistTagDebt(audit, shortId);
+    if (audit) persistTagDebt(audit, shortId, projectCwd);
   } catch (err) {
     log(`[SessionEnd] Tag debt audit failed (non-fatal): ${err.message}`);
   }
@@ -531,14 +557,15 @@ function resolveJsonlPath(cwd) {
  * Detect files changed via git diff from session start HEAD to current HEAD.
  * Falls back to transcript-parsed filesModified set.
  */
-function detectFilesChanged(filesModifiedFromTranscript) {
+function detectFilesChanged(filesModifiedFromTranscript, projectCwd) {
   const gitHeadStartFile = path.join(getSessionsDir(), '.git-head-start');
   const startHead = readFile(gitHeadStartFile);
 
   if (startHead && startHead.trim()) {
     const sha = startHead.trim().replace(/[^a-f0-9]/gi, '');
     if (sha.length >= 7) {
-      const result = runCommand(`git diff --name-only "${sha}..HEAD"`);
+      const gitOpts = projectCwd ? { cwd: projectCwd } : {};
+      const result = runCommand(`git diff --name-only "${sha}..HEAD"`, gitOpts);
       if (result.success && result.output.trim()) {
         return {
           files: result.output.split('\n').filter(Boolean),
@@ -625,7 +652,7 @@ function buildDeltaSummary(summary, files) {
 /**
  * Write a delta entry to the appropriate JSONL file.
  */
-function writeDelta(summary, shortId) {
+function writeDelta(summary, shortId, projectCwd) {
   const totalMessages = summary ? summary.totalMessages : 0;
   const filesModified = summary ? new Set(summary.filesModified) : new Set();
 
@@ -635,9 +662,9 @@ function writeDelta(summary, shortId) {
     return;
   }
 
-  const cwd = process.cwd();
+  const cwd = projectCwd || process.cwd();
   const jsonlPath = resolveJsonlPath(cwd);
-  const { files, via } = detectFilesChanged(filesModified);
+  const { files, via } = detectFilesChanged(filesModified, cwd);
   const workstream = resolveWorkstream(cwd);
   const { type, impact, review_flag } = classifyDelta(files);
 

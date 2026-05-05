@@ -156,7 +156,15 @@ async function main() {
   let injectionSize = 0;
 
   const memoryDir = path.join(getHomeDir(), '.claude', 'projects', '-Users', 'memory');
-  const cwd = process.cwd();
+  // Normalize through realpathSync so the debt key matches what session-end.js
+  // wrote (it normalizes input.cwd the same way). Without this, symlink-vs-realpath
+  // asymmetry strands debt entries: written under one key, read under another.
+  let cwd = process.cwd();
+  try {
+    cwd = fs.realpathSync(cwd);
+  } catch {
+    cwd = path.resolve(cwd);
+  }
 
   // Determine if CWD is an Assay/ILP project
   const assayPaths = [

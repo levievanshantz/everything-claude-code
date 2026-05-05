@@ -112,21 +112,26 @@ function getTimeString() {
 }
 
 /**
- * Get the git repository name
+ * Get the git repository name. Accepts optional cwd so callers running
+ * outside the project root (e.g. Stop hooks invoked with the parent
+ * process's cwd) can resolve against the right directory.
  */
-function getGitRepoName() {
-  const result = runCommand('git rev-parse --show-toplevel');
+function getGitRepoName(cwd) {
+  const opts = cwd ? { cwd } : {};
+  const result = runCommand('git rev-parse --show-toplevel', opts);
   if (!result.success) return null;
   return path.basename(result.output);
 }
 
 /**
- * Get project name from git repo or current directory
+ * Get project name from git repo or current directory.
+ * Pass an explicit cwd when invoking from a hook context where
+ * process.cwd() does not reflect the active project.
  */
-function getProjectName() {
-  const repoName = getGitRepoName();
+function getProjectName(cwd) {
+  const repoName = getGitRepoName(cwd);
   if (repoName) return repoName;
-  return path.basename(process.cwd()) || null;
+  return path.basename(cwd || process.cwd()) || null;
 }
 
 /**
@@ -165,16 +170,19 @@ function sanitizeSessionId(raw) {
 }
 
 /**
- * Get short session ID from CLAUDE_SESSION_ID environment variable
+ * Get short session ID from CLAUDE_SESSION_ID environment variable.
  * Returns last 8 characters, falls back to a sanitized project name then 'default'.
+ * Pass cwd when calling from a hook context where process.cwd() does not
+ * reflect the active project — otherwise the project-name fallback can pick
+ * up the wrong repo (e.g. /Users/levishantz instead of the project dir).
  */
-function getSessionIdShort(fallback = 'default') {
+function getSessionIdShort(fallback = 'default', cwd) {
   const sessionId = process.env.CLAUDE_SESSION_ID;
   if (sessionId && sessionId.length > 0) {
     const sanitized = sanitizeSessionId(sessionId.slice(-8));
     if (sanitized) return sanitized;
   }
-  return sanitizeSessionId(getProjectName()) || sanitizeSessionId(fallback) || 'default';
+  return sanitizeSessionId(getProjectName(cwd)) || sanitizeSessionId(fallback) || 'default';
 }
 
 /**

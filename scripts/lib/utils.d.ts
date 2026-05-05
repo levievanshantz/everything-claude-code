@@ -64,13 +64,13 @@ export function sanitizeSessionId(raw: string | null | undefined): string | null
  * Get short session ID from CLAUDE_SESSION_ID environment variable.
  * Returns last 8 characters, falls back to a sanitized project name then the provided fallback.
  */
-export function getSessionIdShort(fallback?: string): string;
+export function getSessionIdShort(fallback?: string, cwd?: string): string;
 
-/** Get the git repository name from the current working directory */
-export function getGitRepoName(): string | null;
+/** Get the git repository name. Optional cwd resolves against an explicit directory. */
+export function getGitRepoName(cwd?: string): string | null;
 
-/** Get project name from git repo or current directory basename */
-export function getProjectName(): string | null;
+/** Get project name from git repo or current directory basename. Optional cwd. */
+export function getProjectName(cwd?: string): string | null;
 
 // --- File operations ---
 
