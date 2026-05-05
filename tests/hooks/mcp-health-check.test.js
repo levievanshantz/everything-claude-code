@@ -288,6 +288,65 @@ async function runTests() {
     }
   })) passed++; else failed++;
 
+  if (await asyncTest('discovers project-local .claude.json via input.cwd when process.cwd differs', async () => {
+    const tempDir = createTempDir();
+    const projectDir = path.join(tempDir, 'my-project');
+    fs.mkdirSync(projectDir);
+
+    // Project-local config under the input.cwd directory ONLY.
+    // No ECC_MCP_CONFIG_PATH override, so the hook must discover it via
+    // input.cwd. Pre-fix it would scan process.cwd() instead and miss.
+    fs.writeFileSync(path.join(projectDir, '.claude.json'), JSON.stringify({
+      mcpServers: {
+        local: createCommandConfig(path.join(projectDir, 'unhealthy-server.js'))
+      }
+    }, null, 2));
+    fs.writeFileSync(path.join(projectDir, 'unhealthy-server.js'), 'process.exit(1);\n');
+
+    const statePath = path.join(tempDir, 'mcp-health.json');
+
+    try {
+      // Run from a cwd that has NO .claude.json so the project-local config
+      // can only be found by honoring input.cwd.
+      const sandboxDir = path.join(tempDir, 'sandbox');
+      fs.mkdirSync(sandboxDir);
+
+      const result = spawnSync('node', [script], {
+        input: JSON.stringify({
+          tool_name: 'mcp__local__search',
+          tool_input: {},
+          cwd: projectDir
+        }),
+        cwd: sandboxDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ECC_HOOK_PROFILE: 'standard',
+          CLAUDE_HOOK_EVENT_NAME: 'PreToolUse',
+          ECC_MCP_HEALTH_STATE_PATH: statePath,
+          ECC_MCP_HEALTH_TIMEOUT_MS: '200',
+          HOME: tempDir
+        },
+        timeout: 15000,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      // The hook must find the project-local config (not bail with
+      // "No MCP config found"), probe the unhealthy server, and block.
+      assert.ok(
+        !result.stderr.includes('No MCP config found'),
+        `Expected hook to discover project-local config via input.cwd, got: ${result.stderr}`
+      );
+      assert.strictEqual(result.status, 2, `Expected unhealthy server to block, got code ${result.status}`);
+      assert.ok(result.stderr.includes('Blocking search'), `Expected blocking log, got: ${result.stderr}`);
+
+      const state = readState(statePath);
+      assert.strictEqual(state.servers.local.status, 'unhealthy', 'Expected local server to be marked unhealthy');
+    } finally {
+      cleanupTempDir(tempDir);
+    }
+  })) passed++; else failed++;
+
   console.log(`\nResults: Passed: ${passed}, Failed: ${failed}`);
   process.exit(failed > 0 ? 1 : 0);
 }
